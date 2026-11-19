@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import importlib
 import logging
+import os
 import threading
 import time
 import weakref
@@ -57,8 +58,31 @@ _ANE_BANK_RETRY_MAX_BYTES = 1 << 30
 # necessary live: a 4-attempt retry ladder (each individually bounded)
 # still grew process RSS to 48.3GB on a 48GB machine and was jetsam-killed
 # mid-retry.
-_ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
+_DEFAULT_ANE_BANK_RETRY_MAX_MEMORY_FRACTION = 0.70
+try:
+    _ANE_BANK_RETRY_MAX_MEMORY_FRACTION = float(
+        os.environ.get(
+            "OMLX_ANE_BANK_RETRY_MAX_MEMORY_FRACTION",
+            str(_DEFAULT_ANE_BANK_RETRY_MAX_MEMORY_FRACTION),
+        )
+    )
+except (TypeError, ValueError):
+    _ANE_BANK_RETRY_MAX_MEMORY_FRACTION = _DEFAULT_ANE_BANK_RETRY_MAX_MEMORY_FRACTION
 _ANE_BANK_RETRY_SETTLE_SECONDS = 0.5
+
+
+def _ane_bank_memory_headroom_fraction(total: int) -> float:
+    """Allowed memory fraction for ANE bank compile.
+
+    Defaults to 70% on large machines (e.g. 48 GB+), but scales up to 90%
+    on memory-constrained systems (<= 24 GiB) where large models (like 27B)
+    occupy >15 GiB baseline without exceeding physical memory.
+    """
+    if "OMLX_ANE_BANK_RETRY_MAX_MEMORY_FRACTION" in os.environ:
+        return _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    if 0 < total <= 24 * (1024**3):
+        return 0.90
+    return _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
 
 
 def _ane_bank_memory_footprint_snapshot() -> tuple[int, int]:
@@ -82,7 +106,7 @@ def _ane_bank_memory_headroom_ok() -> bool:
     current, total = _ane_bank_memory_footprint_snapshot()
     if total <= 0:
         return True
-    return current < total * _ANE_BANK_RETRY_MAX_MEMORY_FRACTION
+    return current < total * _ane_bank_memory_headroom_fraction(total)
 
 
 @dataclass(frozen=True)
@@ -2206,6 +2230,12 @@ def _bank_split_ladder(
     largest_bytes = max(source_bytes, default=0)
 
     for attempt in range(4):
+        try:
+            mx.synchronize()
+            mx.clear_cache()
+            gc.collect()
+        except Exception:
+            pass
         if not _ane_bank_memory_headroom_ok():
             current, total = _ane_bank_memory_footprint_snapshot()
             logger.warning(
@@ -2216,7 +2246,7 @@ def _bank_split_ladder(
                 attempt + 1,
                 current / (1 << 30),
                 total / (1 << 30),
-                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+                _ane_bank_memory_headroom_fraction(total) * 100,
             )
             return None
         spans = (
@@ -2321,6 +2351,12 @@ def _compile_single_banks(
     largest_bytes = max((weight.nbytes for weight in weights), default=0)
 
     for attempt in range(4):
+        try:
+            mx.synchronize()
+            mx.clear_cache()
+            gc.collect()
+        except Exception:
+            pass
         if not _ane_bank_memory_headroom_ok():
             current, total = _ane_bank_memory_footprint_snapshot()
             logger.warning(
@@ -2331,7 +2367,7 @@ def _compile_single_banks(
                 attempt + 1,
                 current / (1 << 30),
                 total / (1 << 30),
-                _ANE_BANK_RETRY_MAX_MEMORY_FRACTION * 100,
+                _ane_bank_memory_headroom_fraction(total) * 100,
             )
             return None
         spans = (

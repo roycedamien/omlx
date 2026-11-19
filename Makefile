@@ -1,5 +1,5 @@
 # Developer shortcuts. The server itself builds with plain pip and needs none of these.
-PYTHON ?= python3
+PYTHON ?= $(if $(wildcard .venv/bin/python),$(abspath .venv/bin/python),$(or $(shell command -v python3.11 2>/dev/null),python3))
 # setuptools, cmake, and nanobind pins from [build-system]; the kernels must use MLX's nanobind.
 KERNEL_BUILD_DEPS = $(shell $(PYTHON) -c "import tomllib; \
 	reqs = tomllib.load(open('pyproject.toml', 'rb'))['build-system']['requires']; \
@@ -47,4 +47,4 @@ web:
 
 # Build a runnable macOS app bundle with freshly compiled native custom kernels.
 app:
-	apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
+	PYTHON_BIN="$(PYTHON)" apps/omlx-mac/Scripts/build.sh release --with-custom-kernel

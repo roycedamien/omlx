@@ -110,9 +110,28 @@ require_xcode_metal() {
 }
 
 require_venv() {
-    if [ ! -x "$VENVPY" ]; then
-        die "Python venv not found at $VENVPY. Run 'make dev' or create .venv first."
+    local py_ver=""
+    if [ -x "$VENVPY" ]; then
+        py_ver="$("$VENVPY" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")' 2>/dev/null || true)"
     fi
+    if [ "$py_ver" != "3.11" ]; then
+        warn "Virtual environment missing or not Python 3.11 (got '${py_ver:-none}'); creating Python 3.11 .venv…"
+        rm -rf "$REPO_ROOT/.venv"
+        if [ -x "/opt/homebrew/opt/python@3.11/bin/python3.11" ]; then
+            /opt/homebrew/opt/python@3.11/bin/python3.11 -m venv "$REPO_ROOT/.venv"
+        elif command -v python3.11 >/dev/null 2>&1; then
+            "$(command -v python3.11)" -m venv "$REPO_ROOT/.venv"
+        elif command -v uv >/dev/null 2>&1; then
+            uv venv --python 3.11 "$REPO_ROOT/.venv"
+        else
+            die "Python 3.11 not found. Install python@3.11 (e.g. brew install python@3.11) first."
+        fi
+        VENVPY="$REPO_ROOT/.venv/bin/python"
+        "$VENVPY" -m pip install --upgrade pip setuptools wheel
+    fi
+    export VIRTUAL_ENV="$REPO_ROOT/.venv"
+    export PATH="$REPO_ROOT/.venv/bin:$PATH"
+    export PYTHON_BIN="$VENVPY"
 }
 
 # ============================================================

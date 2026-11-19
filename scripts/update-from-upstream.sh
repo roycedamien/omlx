@@ -8,7 +8,7 @@ echo "🔄 Fetching latest changes from upstream..."
 git fetch upstream
 
 echo "📊 Checking for differences..."
-if git diff --quiet HEAD..upstream/main; then
+if [ "$(git rev-list --count HEAD..upstream/main)" -eq 0 ]; then
     echo "✅ Already up to date with upstream/main"
     exit 0
 fi

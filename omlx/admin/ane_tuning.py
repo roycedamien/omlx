@@ -10,6 +10,7 @@ Persisted model settings are never changed by a tuning run.
 from __future__ import annotations
 
 import asyncio
+import gc
 import json
 import logging
 import math
@@ -131,6 +132,7 @@ class ANETuningRun:
     created_at: float = field(default_factory=time.time)
     deadline: float | None = None
     _cancel_calibration: threading.Event = field(default_factory=threading.Event, repr=False)
+    measure_length: int | None = None
 
 
 class _CalibrationCancelled(Exception):
@@ -140,6 +142,29 @@ class _CalibrationCancelled(Exception):
 def _check_calibration_cancelled(run: ANETuningRun) -> None:
     if run._cancel_calibration.is_set():
         raise _CalibrationCancelled
+
+
+def _retain_calibration_entry(
+    prepared: list[tuple[str, float, Any, Any, Any]],
+    source_bytes: list[int],
+    builders: tuple[Any, Any] | None,
+    kind: str,
+    fraction: float,
+    value: tuple[Any, Any, Any],
+    mx: Any,
+) -> None:
+    state, dense0, dense1 = value
+    if builders is not None:
+        if dense1 is None:
+            raise RuntimeError("A dual-ANE calibration slice is incomplete")
+        mx.eval(dense0, dense1)
+        mx.synchronize()
+        source_bytes.append(int(dense0.nbytes))
+        builders[0].add(dense0)
+        builders[1].add(dense1)
+        prepared.append((kind, fraction, state, None, None))
+        return
+    prepared.append((kind, fraction, state, dense0, dense1))
 
 
 class _K2BudgetExpired(Exception):
@@ -588,6 +613,51 @@ def _ane_is_active(engine: Any) -> bool:
     )
 
 
+def _select_measure_length(engine: Any, sequence_length: int) -> int:
+    """Select the largest measure prompt length (4, 3, 2, or 1 complete tile)
+    that fits under the engine scheduler's prefill memory limit.
+    """
+    default_len = sequence_length * 4 + 1
+    scheduler = (
+        getattr(engine, "scheduler", None)
+        or getattr(getattr(engine, "_engine", None), "scheduler", None)
+        or getattr(
+            getattr(getattr(engine, "_engine", None), "engine", None),
+            "scheduler",
+            None,
+        )
+    )
+    if scheduler is None or not hasattr(scheduler, "preflight_or_raise"):
+        return default_len
+
+    from ..exceptions import PrefillMemoryExceededError
+
+    try:
+        import mlx.core as _mx
+
+        _mx.synchronize()
+        _mx.clear_cache()
+    except Exception:
+        pass
+
+    for tiles in (4, 3, 2, 1):
+        cand_len = sequence_length * tiles + 1
+        try:
+            scheduler.preflight_or_raise(num_prompt_tokens=cand_len)
+            if tiles < 4:
+                logger.info(
+                    "ANE tuner scaled measure prompt from 4 tiles to %d tile(s) "
+                    "(%d tokens) to fit within prefill memory limit",
+                    tiles,
+                    cand_len,
+                )
+            return cand_len
+        except PrefillMemoryExceededError:
+            if tiles == 1:
+                return cand_len
+    return default_len
+
+
 async def _measure_candidate(
     run: ANETuningRun,
     engine_pool: Any,
@@ -613,7 +683,12 @@ async def _measure_candidate(
     tokenizer = engine.tokenizer
     warmup_length = run.request.sequence_length + 1
     # stream_generate reserves the final token. Measure complete prefill tiles.
-    measure_length = run.request.sequence_length * 4 + 1
+    if getattr(run, "measure_length", None) is None:
+        run.measure_length = _select_measure_length(
+            engine, run.request.sequence_length
+        )
+    measure_length = run.measure_length
+    warmup_length = min(warmup_length, measure_length)
     warmup = _generate_prompt(
         tokenizer, warmup_length, BenchmarkContextProfile.CODE_PYTHON
     )
@@ -1823,6 +1898,31 @@ def _calibrate_components_sync(
     run.phase = "compiling_calibration"
     run.message = "Compiling representative ANE calibration bank…"
     prepared: list[tuple[str, float, Any, Any, Any]] = []
+    source_bytes: list[int] = []
+    builders = None
+    gc.collect()
+    try:
+        mx.synchronize()
+        mx.clear_cache()
+    except Exception:
+        pass
+    if dual_ane and fast.has_symbol("AneLinearBankBuilder"):
+        try:
+            builders = (
+                fast.qwen35_ane_linear_bank_builder(
+                run.request.sequence_length
+                ),
+                fast.qwen35_ane_linear_bank_builder(
+                    run.request.sequence_length
+                ),
+            )
+        except Exception:
+            logger.debug(
+                "ANE calibration bank builder unavailable; staging all slices",
+                exc_info=True,
+            )
+            builders = None
+
     for fraction in fractions:
         config = patch._AnePrefillConfig(
             run.request.sequence_length,
@@ -1834,8 +1934,9 @@ def _calibrate_components_sync(
         )
         value = patch._prepare_pair_for_bank(mlp, config)
         if value is not None:
-            state, dense0, dense1 = value
-            prepared.append(("mlp", fraction, state, dense0, dense1))
+            _retain_calibration_entry(
+                prepared, source_bytes, builders, "mlp", fraction, value, mx
+            )
     if gdn is not None and run.gdn_floor is not None:
         for fraction in [float(run.gdn_floor)]:
             config = patch._AneGDNConfig(
@@ -1843,34 +1944,60 @@ def _calibrate_components_sync(
             )
             value = patch._prepare_gdn_for_bank(gdn, config)
             if value is not None:
-                state, dense0, dense1 = value
-                prepared.append(("gdn", fraction, state, dense0, dense1))
+                _retain_calibration_entry(
+                    prepared, source_bytes, builders, "gdn", fraction, value, mx
+                )
     if not any(kind == "mlp" for kind, *_ in prepared):
         raise RuntimeError("No valid MLP calibration widths could be prepared")
 
-    dense0 = [entry[3] for entry in prepared]
-    if dual_ane:
-        dense1 = [entry[4] for entry in prepared]
-        if any(weight is None for weight in dense1):
-            raise RuntimeError("A dual-ANE calibration width was prepared incompletely")
-        mx.eval(*dense0, *dense1)
-        banked = patch._compile_dual_banks(
-            dense0,
-            dense1,
-            run.request.sequence_length,
+    if builders is not None:
+        gc.collect()
+        try:
+            mx.synchronize()
+            mx.clear_cache()
+        except Exception:
+            pass
+        banked = patch._bank_split_ladder(
+            source_bytes,
+            lambda start, stop: (
+                builders[0].compile(1, start, stop),
+                builders[1].compile(2, start, stop),
+            ),
         )
+        builders = None
         if banked is None:
             raise RuntimeError("Representative ANE calibration bank could not be loaded")
         models0, models1, _ = banked
     else:
-        mx.eval(*dense0)
-        single_banked = patch._compile_single_banks(
-            dense0, run.request.sequence_length
-        )
-        if single_banked is None:
-            raise RuntimeError("Representative ANE calibration bank could not be loaded")
-        models0, _ = single_banked
-        models1 = [None] * len(models0)
+        dense0 = [entry[3] for entry in prepared]
+        if dual_ane:
+            dense1 = [entry[4] for entry in prepared]
+            if any(weight is None for weight in dense1):
+                raise RuntimeError(
+                    "A dual-ANE calibration width was prepared incompletely"
+                )
+            mx.eval(*dense0, *dense1)
+            banked = patch._compile_dual_banks(
+                dense0,
+                dense1,
+                run.request.sequence_length,
+            )
+            if banked is None:
+                raise RuntimeError(
+                    "Representative ANE calibration bank could not be loaded"
+                )
+            models0, models1, _ = banked
+        else:
+            mx.eval(*dense0)
+            single_banked = patch._compile_single_banks(
+                dense0, run.request.sequence_length
+            )
+            if single_banked is None:
+                raise RuntimeError(
+                    "Representative ANE calibration bank could not be loaded"
+                )
+            models0, _ = single_banked
+            models1 = [None] * len(models0)
     ane_models: dict[tuple[str, float], tuple[Any, Any, Any]] = {}
     for index, (kind, fraction, state, _, _) in enumerate(prepared):
         ane_models[(kind, fraction)] = (models0[index], models1[index], state)
@@ -2170,6 +2297,13 @@ async def run_tuning(run: ANETuningRun, engine_pool: Any) -> None:
         await _measure_result_slot(
             run, _GPU_SLOT, engine_pool, base_settings, baseline
         )
+        gc.collect()
+        try:
+            import mlx.core as _mx
+            _mx.synchronize()
+            _mx.clear_cache()
+        except Exception:
+            pass
 
         gpu_settings = _settings_for_candidate(base_settings, run.request, baseline)
         engine = await engine_pool.get_engine(

@@ -42,6 +42,10 @@ import mlx.nn as nn
 from mlx_lm.models.gated_delta import normalize_qk
 
 from . import qwen35_gdn_verify_fused
+from .fused_projection_storage import (
+    apply_fused_projection_storage_patch,
+    share_fused_projection_storage,
+)
 from .module_cache import cached_per_module
 from .qwen35_verify_qmm import is_row_exact_armed
 from .row_exact_qmv import one_row_qmv, rows_qmv
@@ -1435,7 +1439,7 @@ def _qwen4_decode_static_check(module) -> bool:
     )
 
 
-def _one_row_fused_projections(linears, dtype):
+def _one_row_fused_projections(linears, dtype=None):
     """Operands of mlx-vlm's one-row fused in-projection, or None when it keeps four.
 
     ``_target_verify_linears`` runs one-row decode through
@@ -1446,6 +1450,8 @@ def _one_row_fused_projections(linears, dtype):
     first projection.
     """
     first = linears[0]
+    if dtype is None:
+        dtype = getattr(getattr(first, "scales", None), "dtype", None)
     if not all(
         isinstance(linear, nn.QuantizedLinear)
         and linear.bits == first.bits
@@ -1474,6 +1480,7 @@ def _one_row_fused_projections(linears, dtype):
         mx.eval(weights, scales, biases)
         cached = (cache_key, weights, scales, biases, split_indices)
         first._fused_decode_linears = cached
+        cached = share_fused_projection_storage(linears)
     _, weights, scales, biases, split_indices = cached
     return (
         weights,
@@ -1979,6 +1986,7 @@ def apply_qwen35_gdn_prework_patch() -> bool:
         return True
     if not mx.metal.is_available():
         return False
+    apply_fused_projection_storage_patch()
 
     from mlx_vlm.models.qwen3_5 import language as q35
     from mlx_vlm.models.qwen3_5.speculative_verifier import Qwen3_5BatchInvariantForward

@@ -81,6 +81,47 @@ def test_candidate_settings_preserve_single_ane_mode():
     assert tuned.qwen35_ane_prefill_cpu_gdn_fraction == 0.13
 
 
+def test_calibration_uses_incremental_bank_builder(monkeypatch):
+    class _Array:
+        nbytes = 64
+
+    class _Builder:
+        def __init__(self):
+            self.added = []
+
+        def add(self, value):
+            self.added.append(value)
+
+    class _Mx:
+        @staticmethod
+        def eval(*values):
+            return None
+
+        @staticmethod
+        def synchronize():
+            return None
+
+    builders = (_Builder(), _Builder())
+    prepared = []
+    source_bytes = []
+
+    ane_tuning._retain_calibration_entry(
+        prepared,
+        source_bytes,
+        builders,
+        "mlp",
+        0.5,
+        (object(), _Array(), _Array()),
+        _Mx,
+    )
+
+    assert len(builders[0].added) == 1
+    assert len(builders[1].added) == 1
+    assert source_bytes == [64]
+    assert prepared[0][0:2] == ("mlp", 0.5)
+    assert prepared[0][3:] == (None, None)
+
+
 def test_candidate_settings_apply_tuner_boolean_overrides():
     base = ModelSettings(qwen35_ane_prefill_cpu_shared_resource=True)
     request = ane_tuning.ANETuningRequest(
@@ -1162,3 +1203,30 @@ async def test_cancelled_tuning_stays_active_until_unload_finishes(monkeypatch):
         await asyncio.wait_for(run.task, 5)
     assert run.status == "cancelled"
     assert ane_tuning.get_active_run() is None
+
+
+def test_select_measure_length_scales_down_when_preflight_fails():
+    from omlx.exceptions import PrefillMemoryExceededError
+
+    class _MockScheduler:
+        def preflight_or_raise(self, *, num_prompt_tokens: int, **kwargs):
+            # Only allow prompts <= 4097 tokens
+            if num_prompt_tokens > 4097:
+                raise PrefillMemoryExceededError(
+                    message="Prompt too large",
+                    request_id="test",
+                    estimated_bytes=1000,
+                    limit_bytes=500,
+                )
+
+    engine = SimpleNamespace(
+        _engine=SimpleNamespace(
+            engine=SimpleNamespace(
+                scheduler=_MockScheduler()
+            )
+        )
+    )
+
+    # 4 tiles = 8193 (fails), 3 tiles = 6145 (fails), 2 tiles = 4097 (succeeds)
+    chosen = ane_tuning._select_measure_length(engine, 2048)
+    assert chosen == 2048 * 2 + 1

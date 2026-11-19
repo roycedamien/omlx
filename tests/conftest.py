@@ -72,6 +72,9 @@ _GPU_SERIAL_TESTS = {
         "test_wrap_and_release_return_descriptors_to_baseline",
         "test_wrap_replaces_module_and_keeps_only_slots",
     },
+    "test_fused_projection_storage.py": {
+        "test_fused_cache_does_not_retain_27b_projection_copy",
+    },
     "test_glm5_next_mtp.py": {
         "test_vector_restore_and_continuation_match_scalar",
     },

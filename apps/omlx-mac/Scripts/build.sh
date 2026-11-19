@@ -191,7 +191,15 @@ fi
 
 # --- Resolve donor: pick a layer source and (re)build via venvstacks if stale
 
-PYTHON_BIN="${PYTHON_BIN:-$(command -v python3 || true)}"
+if [ -z "${PYTHON_BIN:-}" ]; then
+    if [ -x "$REPO_ROOT/.venv/bin/python" ]; then
+        PYTHON_BIN="$REPO_ROOT/.venv/bin/python"
+    elif command -v python3.11 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3.11)"
+    else
+        PYTHON_BIN="$(command -v python3 || true)"
+    fi
+fi
 
 # Returns 0 if the local _export/ exists and its stored fingerprint matches
 # the current pyproject/venvstacks/lockfile state.
