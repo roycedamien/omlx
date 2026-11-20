@@ -4,10 +4,14 @@
 # for Apple Silicon (M4) with native custom kernels.
 #
 # Subcommands:
-#   update        (default) git fetch + pull, rebuild kernels, editable install,
-#                 build macOS .app, create custom config/models/cache dirs.
+#   update        (default) git fetch + rebase (auto-stashing uncommitted changes),
+#                 editable install + custom kernels, build macOS .app,
+#                 create custom config/models/cache dirs.
 #   cleanup|uninstall  remove settings, cache, logs, usage DB, build artifacts,
 #                 and custom kernels — but NEVER the Model dir.
+#
+# Flags:
+#   --rebuild-donor     force venvstacks donor rebuild when building the macOS .app
 #
 # Environment:
 #   TOOLCHAINS=Metal        required for Metal kernel builds on Apple Silicon
@@ -30,52 +34,24 @@ DEFAULT_MODELS_DIR="$DEFAULT_BASE_PATH/models"
 DEFAULT_CACHE_DIR="$DEFAULT_BASE_PATH/cache"
 DEFAULT_LOG_DIR="$DEFAULT_BASE_PATH/logs"
 
-# --- Parse flags (apply to both subcommands) ---
-BASE_PATH=""
-MODELS_DIR=""
-CACHE_DIR=""
-LOG_DIR=""
-SUBCOMMAND="update"
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        update|cleanup|uninstall)
-            SUBCOMMAND="$1"
-            shift
+# Expand leading ~ and canonicalize existing directories
+expand_path() {
+    local p="$1"
+    case "$p" in
+        "~")
+            p="$HOME"
             ;;
-        --base-path)
-            BASE_PATH="$2"; shift 2 ;;
-        --models-dir)
-            MODELS_DIR="$2"; shift 2 ;;
-        --cache-dir)
-            CACHE_DIR="$2"; shift 2 ;;
-        --log-dir)
-            LOG_DIR="$2"; shift 2 ;;
-        -h|--help)
-            echo "Usage: $0 [update|cleanup|uninstall] [--base-path PATH] [--models-dir PATH] [--cache-dir PATH] [--log-dir PATH]"
-            echo ""
-            echo "Subcommands:"
-            echo "  update        (default) pull from upstream, rebuild kernels + app, create dirs"
-            echo "  cleanup|uninstall  remove settings/cache/logs/build artifacts (preserves Model dir)"
-            echo ""
-            echo "Default paths:"
-            echo "  Base path:   $DEFAULT_BASE_PATH"
-            echo "  Models dir:  $DEFAULT_MODELS_DIR  (PRESERVED by cleanup)"
-            echo "  Cache dir:   $DEFAULT_CACHE_DIR"
-            echo "  Log dir:     $DEFAULT_LOG_DIR"
-            echo ""
-            echo "Env overrides: TOOLCHAINS=Metal, PYTHON_BIN, OMLX_BASE_PATH, OMLX_MODEL_DIR,"
-            echo "               OMLX_SSD_CACHE_DIR, OMLX_LOG_DIR"
-            exit 0
-            ;;
-        *)
-            echo "error: unknown argument '$1'" >&2
-            exit 2
+        "~/"*)
+            p="$HOME/${p#??}"
             ;;
     esac
-done
+    if [ -d "$p" ]; then
+        (cd "$p" && pwd)
+    else
+        printf '%s\n' "$p"
+    fi
+}
 
-# Resolve paths (CLI flag > env var > default)
 resolve_base_path() {
     if [ -n "$BASE_PATH" ]; then
         echo "$BASE_PATH"
@@ -85,17 +61,6 @@ resolve_base_path() {
         echo "$DEFAULT_BASE_PATH"
     fi
 }
-
-BASE_PATH="$(resolve_base_path)"
-MODELS_DIR="${MODELS_DIR:-${OMLX_MODEL_DIR:-$DEFAULT_MODELS_DIR}}"
-CACHE_DIR="${CACHE_DIR:-${OMLX_SSD_CACHE_DIR:-$DEFAULT_CACHE_DIR}}"
-LOG_DIR="${LOG_DIR:-${OMLX_LOG_DIR:-$DEFAULT_LOG_DIR}}"
-
-# Expand ~ and make absolute
-BASE_PATH="$(cd "$BASE_PATH" 2>/dev/null && pwd || echo "$BASE_PATH")"
-MODELS_DIR="$(cd "$MODELS_DIR" 2>/dev/null && pwd || echo "$MODELS_DIR")"
-CACHE_DIR="$(cd "$CACHE_DIR" 2>/dev/null && pwd || echo "$CACHE_DIR")"
-LOG_DIR="$(cd "$LOG_DIR" 2>/dev/null && pwd || echo "$LOG_DIR")"
 
 log()   { printf "\033[1;34m[update_and_rebuild]\033[0m %s\n" "$*"; }
 ok()    { printf "\033[1;32m[update_and_rebuild]\033[0m %s\n" "$*"; }
@@ -142,43 +107,76 @@ cmd_update() {
     log "Models dir:       $MODELS_DIR"
     log "Cache dir:        $CACHE_DIR"
     log "Log dir:          $LOG_DIR"
-    log "Python:           $VENVPY"
 
     # 1. Git update from upstream
-    log "Fetching and rebasing onto upstream/main…"
     cd "$REPO_ROOT"
-    UPSTREAM_REMOTE="upstream"
-    if ! git remote get-url "$UPSTREAM_REMOTE" >/dev/null 2>&1; then
+    local UPSTREAM_REMOTE=""
+    if git remote get-url upstream >/dev/null 2>&1; then
+        UPSTREAM_REMOTE="upstream"
+    elif git remote get-url origin >/dev/null 2>&1; then
         UPSTREAM_REMOTE="origin"
+    else
+        die "Neither 'upstream' nor 'origin' git remote is configured."
     fi
-    git fetch "$UPSTREAM_REMOTE"
-    git rebase "$UPSTREAM_REMOTE/main"
-    ok "Repository is up to date."
 
-    # 2. Rebuild native custom kernels (Metal toolchain required for M4)
+    local git_dir
+    git_dir="$(git rev-parse --git-dir)"
+    if [ -d "$git_dir/rebase-merge" ] || [ -d "$git_dir/rebase-apply" ]; then
+        die "A git rebase is already in progress. Finish or abort it first ('git rebase --continue' or 'git rebase --abort')."
+    fi
+
+    log "Fetching latest changes from ${UPSTREAM_REMOTE}…"
+    git fetch "$UPSTREAM_REMOTE"
+
+    local target_ref="${UPSTREAM_REMOTE}/main"
+    if ! git rev-parse --verify --quiet "$target_ref" >/dev/null; then
+        die "Remote branch '${target_ref}' not found after fetch."
+    fi
+
+    local behind
+    behind="$(git rev-list --count "HEAD..${target_ref}")"
+    if [ "$behind" -eq 0 ]; then
+        ok "Already up to date with ${target_ref}."
+    else
+        if ! git diff --quiet || ! git diff --cached --quiet; then
+            warn "Uncommitted changes detected — auto-stashing during rebase…"
+        fi
+        log "Rebasing onto ${target_ref}…"
+        if ! git rebase --autostash "$target_ref"; then
+            die "Rebase failed (likely due to conflicts). Git has preserved your autostash; resolve conflicts and run 'git rebase --continue', or run 'git rebase --abort' to restore your state."
+        fi
+        ok "Repository rebased onto ${target_ref}."
+    fi
+
+    # 2. Editable install + native custom kernels (Metal toolchain + Python 3.11 .venv)
     require_xcode_metal
     require_venv
-    log "Rebuilding native custom kernels (TOOLCHAINS=Metal)…"
-    TOOLCHAINS=Metal make kernels PYTHON="$VENVPY"
-    ok "Custom kernels rebuilt."
+    log "Python:           $VENVPY"
+    log "Installing editable package and rebuilding native custom kernels (TOOLCHAINS=Metal)…"
+    TOOLCHAINS=Metal make install PYTHON="$VENVPY"
+    ok "Editable install and custom kernels complete."
 
-    # Verify kernels load
-    log "Verifying custom kernels load…"
-    "$VENVPY" -c "from omlx.custom_kernels import native_kernel_status; print(native_kernel_status())"
-    ok "Custom kernels verified."
+    # 3. Build macOS .app bundle with custom kernels
+    local donor_flag="--no-rebuild-donor"
+    if [ "$REBUILD_DONOR" = "force" ]; then
+        donor_flag="--rebuild-donor"
+    elif [ ! -d "$REPO_ROOT/packaging/_export" ] && [ ! -d "${OMLX_DONOR_APP:-/Applications/oMLX.app}" ]; then
+        warn "No existing donor layers found at packaging/_export or ${OMLX_DONOR_APP:-/Applications/oMLX.app}; allowing build.sh to auto-build donor."
+        donor_flag=""
+    fi
 
-    # 3. Editable install (server + CLI + web UI + kernels)
-    log "Running editable install (make install)…"
-    make install PYTHON="$VENVPY"
-    ok "Editable install complete."
-
-    # 4. Build macOS .app bundle with custom kernels
-    log "Building macOS app (release, with custom kernel, no-rebuild-donor)…"
-    TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
-        apps/omlx-mac/Scripts/build.sh release --with-custom-kernel --no-rebuild-donor
+    if [ -n "$donor_flag" ]; then
+        log "Building macOS app (release, with custom kernel, ${donor_flag})…"
+        TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
+            apps/omlx-mac/Scripts/build.sh release --with-custom-kernel "$donor_flag"
+    else
+        log "Building macOS app (release, with custom kernel, auto donor)…"
+        TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
+            apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
+    fi
     ok "macOS app staged at apps/omlx-mac/build/Stage/oMLX.app"
 
-    # 5. Create custom directories
+    # 4. Create custom directories
     log "Ensuring directories exist…"
     mkdir -p "$BASE_PATH"
     mkdir -p "$MODELS_DIR"
@@ -186,7 +184,7 @@ cmd_update() {
     mkdir -p "$LOG_DIR"
     ok "Directories ready."
 
-    # 6. Print config path summary
+    # 5. Print config path summary
     echo ""
     echo "============================================================"
     echo "  oMLX config path summary"
@@ -293,16 +291,89 @@ cmd_cleanup() {
 }
 
 # ============================================================
-# Dispatch
+# Main
 # ============================================================
-case "$SUBCOMMAND" in
-    update)
-        cmd_update
-        ;;
-    cleanup|uninstall)
-        cmd_cleanup
-        ;;
-    *)
-        die "Unknown subcommand: $SUBCOMMAND"
-        ;;
-esac
+main() {
+    BASE_PATH=""
+    MODELS_DIR=""
+    CACHE_DIR=""
+    LOG_DIR=""
+    SUBCOMMAND="update"
+    REBUILD_DONOR="never"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            update|cleanup|uninstall)
+                SUBCOMMAND="$1"
+                shift
+                ;;
+            --base-path)
+                [ $# -ge 2 ] || { echo "error: $1 requires a value" >&2; exit 2; }
+                BASE_PATH="$2"; shift 2 ;;
+            --models-dir)
+                [ $# -ge 2 ] || { echo "error: $1 requires a value" >&2; exit 2; }
+                MODELS_DIR="$2"; shift 2 ;;
+            --cache-dir)
+                [ $# -ge 2 ] || { echo "error: $1 requires a value" >&2; exit 2; }
+                CACHE_DIR="$2"; shift 2 ;;
+            --log-dir)
+                [ $# -ge 2 ] || { echo "error: $1 requires a value" >&2; exit 2; }
+                LOG_DIR="$2"; shift 2 ;;
+            --rebuild-donor)
+                REBUILD_DONOR="force"
+                shift
+                ;;
+            -h|--help)
+                echo "Usage: $0 [update|cleanup|uninstall] [--base-path PATH] [--models-dir PATH] [--cache-dir PATH] [--log-dir PATH] [--rebuild-donor]"
+                echo ""
+                echo "Subcommands:"
+                echo "  update             (default) fetch + rebase (auto-stashing uncommitted changes),"
+                echo "                     editable install + custom kernels, build macOS .app, create dirs"
+                echo "  cleanup|uninstall  remove settings/cache/logs/build artifacts (preserves Model dir)"
+                echo ""
+                echo "Flags:"
+                echo "  --rebuild-donor    force venvstacks donor rebuild when building the macOS .app"
+                echo ""
+                echo "Default paths:"
+                echo "  Base path:   $DEFAULT_BASE_PATH"
+                echo "  Models dir:  $DEFAULT_MODELS_DIR  (PRESERVED by cleanup)"
+                echo "  Cache dir:   $DEFAULT_CACHE_DIR"
+                echo "  Log dir:     $DEFAULT_LOG_DIR"
+                echo ""
+                echo "Env overrides: TOOLCHAINS=Metal, PYTHON_BIN, OMLX_BASE_PATH, OMLX_MODEL_DIR,"
+                echo "               OMLX_SSD_CACHE_DIR, OMLX_LOG_DIR"
+                exit 0
+                ;;
+            *)
+                echo "error: unknown argument '$1'" >&2
+                exit 2
+                ;;
+        esac
+    done
+
+    # Resolve paths (CLI flag > env var > default)
+    BASE_PATH="$(resolve_base_path)"
+    MODELS_DIR="${MODELS_DIR:-${OMLX_MODEL_DIR:-$DEFAULT_MODELS_DIR}}"
+    CACHE_DIR="${CACHE_DIR:-${OMLX_SSD_CACHE_DIR:-$DEFAULT_CACHE_DIR}}"
+    LOG_DIR="${LOG_DIR:-${OMLX_LOG_DIR:-$DEFAULT_LOG_DIR}}"
+
+    # Expand ~ and make absolute when directories exist
+    BASE_PATH="$(expand_path "$BASE_PATH")"
+    MODELS_DIR="$(expand_path "$MODELS_DIR")"
+    CACHE_DIR="$(expand_path "$CACHE_DIR")"
+    LOG_DIR="$(expand_path "$LOG_DIR")"
+
+    case "$SUBCOMMAND" in
+        update)
+            cmd_update
+            ;;
+        cleanup|uninstall)
+            cmd_cleanup
+            ;;
+        *)
+            die "Unknown subcommand: $SUBCOMMAND"
+            ;;
+    esac
+}
+
+main "$@"
