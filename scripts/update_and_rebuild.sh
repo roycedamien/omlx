@@ -5,13 +5,15 @@
 #
 # Subcommands:
 #   update        (default) git fetch + rebase (auto-stashing uncommitted changes),
-#                 editable install + custom kernels, build macOS .app,
+#                 make dev (editable install + dev tools + custom kernels),
+#                 make web, make app (auto-rebuilding stale donor layers),
 #                 create custom config/models/cache dirs.
 #   cleanup|uninstall  remove settings, cache, logs, usage DB, build artifacts,
 #                 and custom kernels — but NEVER the Model dir.
 #
 # Flags:
 #   --rebuild-donor     force venvstacks donor rebuild when building the macOS .app
+#   --no-rebuild-donor  reuse existing donor layers even if stale
 #
 # Environment:
 #   TOOLCHAINS=Metal        required for Metal kernel builds on Apple Silicon
@@ -69,8 +71,10 @@ die()   { printf "\033[1;31m[update_and_rebuild ERROR]\033[0m %s\n" "$*" >&2; ex
 
 # --- Prerequisite checks ---
 require_xcode_metal() {
-    if ! xcrun --find metal >/dev/null 2>&1 && ! xcrun metal --version >/dev/null 2>&1; then
-        die "Metal toolchain not found. Install full Xcode and run: xcodebuild -downloadComponent MetalToolchain"
+    if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+        warn "xcrun metal check failed; refreshing xcrun lookup cache and retrying…"
+        xcrun --kill-cache -sdk macosx metal --version >/dev/null 2>&1 \
+            || die "Metal toolchain not found or not usable. Install full Xcode and run: xcodebuild -downloadComponent MetalToolchain"
     fi
 }
 
@@ -148,35 +152,47 @@ cmd_update() {
         ok "Repository rebased onto ${target_ref}."
     fi
 
-    # 2. Editable install + native custom kernels (Metal toolchain + Python 3.11 .venv)
+    # 2. Editable dev install + native custom kernels (includes everything in make install)
     require_xcode_metal
     require_venv
     log "Python:           $VENVPY"
-    log "Installing editable package and rebuilding native custom kernels (TOOLCHAINS=Metal)…"
-    TOOLCHAINS=Metal make install PYTHON="$VENVPY"
-    ok "Editable install and custom kernels complete."
+    log "Installing editable dev environment and rebuilding native custom kernels (make dev, TOOLCHAINS=Metal)…"
+    TOOLCHAINS=Metal make dev PYTHON="$VENVPY"
+    ok "Editable dev install and custom kernels complete."
 
-    # 3. Build macOS .app bundle with custom kernels
-    local donor_flag="--no-rebuild-donor"
-    if [ "$REBUILD_DONOR" = "force" ]; then
-        donor_flag="--rebuild-donor"
-    elif [ ! -d "$REPO_ROOT/packaging/_export" ] && [ ! -d "${OMLX_DONOR_APP:-/Applications/oMLX.app}" ]; then
-        warn "No existing donor layers found at packaging/_export or ${OMLX_DONOR_APP:-/Applications/oMLX.app}; allowing build.sh to auto-build donor."
-        donor_flag=""
-    fi
+    # 3. Rebuild web UI CSS and normalize i18n files
+    log "Rebuilding web UI assets (make web)…"
+    make web PYTHON="$VENVPY"
+    ok "Web UI assets rebuilt."
 
-    if [ -n "$donor_flag" ]; then
-        log "Building macOS app (release, with custom kernel, ${donor_flag})…"
-        TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
-            apps/omlx-mac/Scripts/build.sh release --with-custom-kernel "$donor_flag"
-    else
-        log "Building macOS app (release, with custom kernel, auto donor)…"
-        TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
-            apps/omlx-mac/Scripts/build.sh release --with-custom-kernel
-    fi
+    # 4. Build macOS .app bundle with custom kernels
+    case "$REBUILD_DONOR" in
+        auto)
+            log "Building macOS app (make app, auto-rebuilding stale donor if needed)…"
+            TOOLCHAINS=Metal make app PYTHON="$VENVPY"
+            ;;
+        force)
+            log "Building macOS app (release, with custom kernel, --rebuild-donor)…"
+            TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
+                apps/omlx-mac/Scripts/build.sh release --with-custom-kernel --rebuild-donor
+            ;;
+        never)
+            if [ ! -d "$REPO_ROOT/packaging/_export" ] && [ ! -d "${OMLX_DONOR_APP:-/Applications/oMLX.app}" ]; then
+                warn "No existing donor layers found at packaging/_export or ${OMLX_DONOR_APP:-/Applications/oMLX.app}; running make app to auto-build donor."
+                TOOLCHAINS=Metal make app PYTHON="$VENVPY"
+            else
+                log "Building macOS app (release, with custom kernel, --no-rebuild-donor)…"
+                TOOLCHAINS=Metal PYTHON_BIN="$VENVPY" \
+                    apps/omlx-mac/Scripts/build.sh release --with-custom-kernel --no-rebuild-donor
+            fi
+            ;;
+        *)
+            die "Invalid REBUILD_DONOR mode: $REBUILD_DONOR"
+            ;;
+    esac
     ok "macOS app staged at apps/omlx-mac/build/Stage/oMLX.app"
 
-    # 4. Create custom directories
+    # 5. Create custom directories
     log "Ensuring directories exist…"
     mkdir -p "$BASE_PATH"
     mkdir -p "$MODELS_DIR"
@@ -184,7 +200,7 @@ cmd_update() {
     mkdir -p "$LOG_DIR"
     ok "Directories ready."
 
-    # 5. Print config path summary
+    # 6. Print config path summary
     echo ""
     echo "============================================================"
     echo "  oMLX config path summary"
@@ -299,7 +315,7 @@ main() {
     CACHE_DIR=""
     LOG_DIR=""
     SUBCOMMAND="update"
-    REBUILD_DONOR="never"
+    REBUILD_DONOR="auto"
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -323,16 +339,22 @@ main() {
                 REBUILD_DONOR="force"
                 shift
                 ;;
+            --no-rebuild-donor)
+                REBUILD_DONOR="never"
+                shift
+                ;;
             -h|--help)
-                echo "Usage: $0 [update|cleanup|uninstall] [--base-path PATH] [--models-dir PATH] [--cache-dir PATH] [--log-dir PATH] [--rebuild-donor]"
+                echo "Usage: $0 [update|cleanup|uninstall] [--base-path PATH] [--models-dir PATH] [--cache-dir PATH] [--log-dir PATH] [--rebuild-donor|--no-rebuild-donor]"
                 echo ""
                 echo "Subcommands:"
-                echo "  update             (default) fetch + rebase (auto-stashing uncommitted changes),"
-                echo "                     editable install + custom kernels, build macOS .app, create dirs"
+                echo "  update             (default) git fetch + rebase (auto-stashing uncommitted changes),"
+                echo "                     make dev (editable install + dev tools + custom kernels),"
+                echo "                     make web, make app (auto-rebuilding stale donor layers), create dirs"
                 echo "  cleanup|uninstall  remove settings/cache/logs/build artifacts (preserves Model dir)"
                 echo ""
                 echo "Flags:"
-                echo "  --rebuild-donor    force venvstacks donor rebuild when building the macOS .app"
+                echo "  --rebuild-donor     force venvstacks donor rebuild when building the macOS .app"
+                echo "  --no-rebuild-donor  reuse existing donor layers even if stale"
                 echo ""
                 echo "Default paths:"
                 echo "  Base path:   $DEFAULT_BASE_PATH"
